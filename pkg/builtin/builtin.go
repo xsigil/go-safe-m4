@@ -1,55 +1,70 @@
-package m4
+package builtin
 
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/xsigil/go-safe-m4/pkg/lexer"
 )
 
-type MacroFunc func(e *Engine, args []string) (string, error)
-
-func registerDefaultBuiltins(e *Engine) {
-	e.RegisterBuiltin("define", builtinDefine)
-	e.RegisterBuiltin("undefine", builtinUndefine)
-	e.RegisterBuiltin("ifdef", builtinIfdef)
-	e.RegisterBuiltin("ifelse", builtinIfelse)
-	e.RegisterBuiltin("changequote", builtinChangequote)
-	e.RegisterBuiltin("divert", builtinDivert)
-	e.RegisterBuiltin("undivert", builtinUndivert)
-	e.RegisterBuiltin("include", builtinInclude)
-	e.RegisterBuiltin("dnl", builtinDnl)
+type EngineContext interface {
+	RegisterBuiltin(name string, fn MacroFunc)
+	SetMacro(name, val string)
+	DeleteMacro(name string)
+	HasMacroOrBuiltin(name string) bool
+	GetLexer() *lexer.Lexer
+	SetCurrentDiv(div int)
+	GetDiversions() map[int]*strings.Builder
+	GetSandboxRoot() string
 }
 
-func builtinDefine(e *Engine, args []string) (string, error) {
+type MacroFunc func(ctx EngineContext, args []string) (string, error)
+
+func RegisterDefaults(ctx EngineContext) {
+	ctx.RegisterBuiltin("define", BuiltinDefine)
+	ctx.RegisterBuiltin("undefine", BuiltinUndefine)
+	ctx.RegisterBuiltin("ifdef", BuiltinIfdef)
+	ctx.RegisterBuiltin("ifelse", BuiltinIfelse)
+	ctx.RegisterBuiltin("changequote", BuiltinChangequote)
+	ctx.RegisterBuiltin("divert", BuiltinDivert)
+	ctx.RegisterBuiltin("undivert", BuiltinUndivert)
+	ctx.RegisterBuiltin("include", BuiltinInclude)
+	ctx.RegisterBuiltin("dnl", BuiltinDnl)
+
+	// Modern Safe M4 Escaping Builtins
+	ctx.RegisterBuiltin("h", BuiltinHTMLEscape)
+	ctx.RegisterBuiltin("html_escape", BuiltinHTMLEscape)
+	ctx.RegisterBuiltin("json_escape", BuiltinJSONEscape)
+	ctx.RegisterBuiltin("sh_quote", BuiltinShellQuote)
+}
+
+func BuiltinDefine(ctx EngineContext, args []string) (string, error) {
 	if len(args) < 1 || args[0] == "" {
 		return "", nil
 	}
-	name := args[0]
 	val := ""
 	if len(args) >= 2 {
 		val = args[1]
 	}
-	e.macros[name] = val
+	ctx.SetMacro(args[0], val)
 	return "", nil
 }
 
-func builtinUndefine(e *Engine, args []string) (string, error) {
+func BuiltinUndefine(ctx EngineContext, args []string) (string, error) {
 	if len(args) > 0 {
-		delete(e.macros, args[0])
-		delete(e.builtins, args[0])
+		ctx.DeleteMacro(args[0])
 	}
 	return "", nil
 }
 
-func builtinIfdef(e *Engine, args []string) (string, error) {
+func BuiltinIfdef(ctx EngineContext, args []string) (string, error) {
 	if len(args) < 2 {
 		return "", nil
 	}
-	name := args[0]
-	_, isMacro := e.macros[name]
-	_, isBuiltin := e.builtins[name]
-	if isMacro || isBuiltin {
+	if ctx.HasMacroOrBuiltin(args[0]) {
 		return args[1], nil
 	}
 	if len(args) >= 3 {
@@ -58,7 +73,7 @@ func builtinIfdef(e *Engine, args []string) (string, error) {
 	return "", nil
 }
 
-func builtinIfelse(e *Engine, args []string) (string, error) {
+func BuiltinIfelse(ctx EngineContext, args []string) (string, error) {
 	for len(args) >= 3 {
 		if args[0] == args[1] {
 			return args[2], nil
@@ -71,36 +86,38 @@ func builtinIfelse(e *Engine, args []string) (string, error) {
 	return "", nil
 }
 
-func builtinChangequote(e *Engine, args []string) (string, error) {
+func BuiltinChangequote(ctx EngineContext, args []string) (string, error) {
+	l := ctx.GetLexer()
 	if len(args) == 0 || (args[0] == "" && len(args) == 1) {
-		e.lexer.leftQuote = "`"
-		e.lexer.rightQuote = "'"
+		l.LeftQuote = "`"
+		l.RightQuote = "'"
 		return "", nil
 	}
-	e.lexer.leftQuote = args[0]
+	l.LeftQuote = args[0]
 	if len(args) >= 2 {
-		e.lexer.rightQuote = args[1]
+		l.RightQuote = args[1]
 	} else {
-		e.lexer.rightQuote = "'"
+		l.RightQuote = "'"
 	}
 	return "", nil
 }
 
-func builtinDivert(e *Engine, args []string) (string, error) {
+func BuiltinDivert(ctx EngineContext, args []string) (string, error) {
 	divNum := 0
 	if len(args) > 0 && args[0] != "" {
 		if n, err := strconv.Atoi(args[0]); err == nil {
 			divNum = n
 		}
 	}
-	e.currentDiv = divNum
+	ctx.SetCurrentDiv(divNum)
 	return "", nil
 }
 
-func builtinUndivert(e *Engine, args []string) (string, error) {
+func BuiltinUndivert(ctx EngineContext, args []string) (string, error) {
+	divs := ctx.GetDiversions()
 	var targetDivs []int
 	if len(args) == 0 {
-		for d := range e.diversions {
+		for d := range divs {
 			if d > 0 {
 				targetDivs = append(targetDivs, d)
 			}
@@ -115,32 +132,71 @@ func builtinUndivert(e *Engine, args []string) (string, error) {
 
 	var out strings.Builder
 	for _, d := range targetDivs {
-		if buf, exists := e.diversions[d]; exists {
+		if buf, exists := divs[d]; exists {
 			out.WriteString(buf.String())
-			delete(e.diversions, d)
+			delete(divs, d)
 		}
 	}
 	return out.String(), nil
 }
 
-func builtinInclude(e *Engine, args []string) (string, error) {
+func BuiltinInclude(ctx EngineContext, args []string) (string, error) {
 	if len(args) == 0 || args[0] == "" {
 		return "", fmt.Errorf("include: missing file path")
 	}
-	content, err := os.ReadFile(args[0])
+
+	root := ctx.GetSandboxRoot()
+	cleanPath := filepath.Clean(args[0])
+
+	var targetPath string
+	if root != "" {
+		targetPath = filepath.Join(root, cleanPath)
+		rel, err := filepath.Rel(root, targetPath)
+		if err != nil || strings.HasPrefix(rel, "..") || strings.HasPrefix(rel, "/") {
+			return "", fmt.Errorf("security violation: path traversal detected in include(%s)", args[0])
+		}
+	} else {
+		if filepath.IsAbs(cleanPath) {
+			return "", fmt.Errorf("security violation: absolute paths not allowed in include(%s)", args[0])
+		}
+		targetPath = cleanPath
+	}
+
+	content, err := os.ReadFile(targetPath)
 	if err != nil {
 		return "", fmt.Errorf("include(%s): %w", args[0], err)
 	}
 	return string(content), nil
 }
 
-// dnl: Delete to NewLine (改行文字までを無視する)
-func builtinDnl(e *Engine, args []string) (string, error) {
+func BuiltinDnl(ctx EngineContext, args []string) (string, error) {
+	l := ctx.GetLexer()
 	for {
-		r, ok := e.lexer.readRune()
+		r, ok := l.ReadRune()
 		if !ok || r == '\n' {
 			break
 		}
 	}
 	return "", nil
+}
+
+func BuiltinHTMLEscape(ctx EngineContext, args []string) (string, error) {
+	if len(args) == 0 {
+		return "", nil
+	}
+	return HTMLEscape(args[0]), nil
+}
+
+func BuiltinJSONEscape(ctx EngineContext, args []string) (string, error) {
+	if len(args) == 0 {
+		return "", nil
+	}
+	return JSONEscape(args[0])
+}
+
+func BuiltinShellQuote(ctx EngineContext, args []string) (string, error) {
+	if len(args) == 0 {
+		return "", nil
+	}
+	return ShellQuote(args[0]), nil
 }

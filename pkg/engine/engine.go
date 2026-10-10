@@ -1,193 +1,246 @@
-package m4
+package engine
 
 import (
-	"bytes"
 	"fmt"
-	"io"
 	"strconv"
 	"strings"
+
+	"github.com/xsigil/go-safe-m4/pkg/builtin"
+	"github.com/xsigil/go-safe-m4/pkg/lexer"
 )
 
 type Engine struct {
-	lexer      *Lexer
-	macros     map[string]string
-	builtins   map[string]MacroFunc
-	diversions map[int]*bytes.Buffer
-	currentDiv int
+	lex         *lexer.Lexer
+	macros      map[string]string
+	builtins    map[string]builtin.MacroFunc
+	diversions  map[int]*strings.Builder
+	currentDiv  int
+	sandboxRoot string
+	maxDepth    int
 }
 
-func NewEngine() *Engine {
+func NewEngine(opts ...Option) *Engine {
 	e := &Engine{
-		lexer:      NewLexer(),
-		macros:     make(map[string]string),
-		builtins:   make(map[string]MacroFunc),
-		diversions: make(map[int]*bytes.Buffer),
-		currentDiv: 0,
+		lex:         lexer.NewLexer(),
+		macros:      make(map[string]string),
+		builtins:    make(map[string]builtin.MacroFunc),
+		diversions:  make(map[int]*strings.Builder),
+		currentDiv:  0,
+		sandboxRoot: ".",
+		maxDepth:    1024,
 	}
-	registerDefaultBuiltins(e)
+	builtin.RegisterDefaults(e)
+	for _, opt := range opts {
+		opt(e)
+	}
 	return e
 }
 
-func (e *Engine) RegisterBuiltin(name string, fn MacroFunc) {
+type Option func(*Engine)
+
+func WithSandboxRoot(root string) Option {
+	return func(e *Engine) {
+		e.sandboxRoot = root
+	}
+}
+
+func (e *Engine) RegisterBuiltin(name string, fn builtin.MacroFunc) {
 	e.builtins[name] = fn
+}
+
+func (e *Engine) SetMacro(name, val string) {
+	e.macros[name] = val
+}
+
+func (e *Engine) DeleteMacro(name string) {
+	delete(e.macros, name)
+	delete(e.builtins, name)
+}
+
+func (e *Engine) HasMacroOrBuiltin(name string) bool {
+	if _, ok := e.builtins[name]; ok {
+		return true
+	}
+	_, ok := e.macros[name]
+	return ok
+}
+
+func (e *Engine) GetLexer() *lexer.Lexer {
+	return e.lex
+}
+
+func (e *Engine) SetCurrentDiv(div int) {
+	e.currentDiv = div
+}
+
+func (e *Engine) GetDiversions() map[int]*strings.Builder {
+	return e.diversions
+}
+
+func (e *Engine) GetSandboxRoot() string {
+	return e.sandboxRoot
 }
 
 func (e *Engine) Define(name, value string) {
 	e.macros[name] = value
 }
 
-// Expand は入力文字列を展開して結果を返します
 func (e *Engine) Expand(input string) (string, error) {
-	e.lexer.PushInput(input)
+	e.lex.PushInput(input)
+	depth := 0
 
 	for {
-		tok, err := e.lexer.NextToken()
-		if err == io.EOF {
+		tok, ok := e.lex.NextToken()
+		if !ok {
 			break
-		}
-		if err != nil {
-			return "", err
 		}
 
 		switch tok.Type {
-		case TokenQuoted:
+		case lexer.TokenQuoted, lexer.TokenOther:
 			e.writeOutput(tok.Value)
 
-		case TokenOther:
-			e.writeOutput(tok.Value)
-
-		case TokenIdent:
+		case lexer.TokenIdent:
 			name := tok.Value
-			isMacro := e.hasMacro(name)
-
-			if !isMacro {
+			if !e.HasMacroOrBuiltin(name) {
 				e.writeOutput(name)
 				continue
 			}
 
-			// マクロの場合、直後に '(' が続くか先読みして確認
-			args, hasParen, err := e.parseMacroArgs()
+			args, _, err := e.collectArgs()
 			if err != nil {
 				return "", err
 			}
 
-			expansion, err := e.evalMacro(name, args, hasParen)
+			depth++
+			if depth > e.maxDepth {
+				return "", fmt.Errorf("maximum macro recursion depth exceeded (%d)", e.maxDepth)
+			}
+
+			if isRawBuiltin(name) {
+				res, err := e.evalMacro(name, args)
+				if err != nil {
+					return "", err
+				}
+				e.writeOutput(res)
+				continue
+			}
+
+			expansion, err := e.evalMacro(name, args)
 			if err != nil {
 				return "", err
 			}
 
-			// 展開結果を再度入力スタックに積んで再評価（m4 の原則）
-			e.lexer.PushInput(expansion)
+			e.lex.PushInput(expansion)
 		}
 	}
 
-	// undivert の残り（0 以外のダイバージョン）を最後に連結
-	var finalOut bytes.Buffer
+	var finalOut strings.Builder
 	if out0, ok := e.diversions[0]; ok {
 		finalOut.WriteString(out0.String())
 	}
 	return finalOut.String(), nil
 }
 
-func (e *Engine) hasMacro(name string) bool {
-	if _, ok := e.builtins[name]; ok {
+func isRawBuiltin(name string) bool {
+	switch name {
+	case "h", "html_escape", "json_escape", "sh_quote":
 		return true
+	default:
+		return false
 	}
-	if _, ok := e.macros[name]; ok {
-		return true
-	}
-	return false
 }
 
 func (e *Engine) writeOutput(s string) {
 	if e.currentDiv < 0 {
-		return // 負のダイバージョンは出力を捨てる
+		return
 	}
 	buf, ok := e.diversions[e.currentDiv]
 	if !ok {
-		buf = &bytes.Buffer{}
+		buf = &strings.Builder{}
 		e.diversions[e.currentDiv] = buf
 	}
 	buf.WriteString(s)
 }
 
-func (e *Engine) parseMacroArgs() ([]string, bool, error) {
-	// 空白をスキップせずに直後の文字を確認
-	r, ok := e.lexer.readRune()
+func (e *Engine) collectArgs() ([]string, bool, error) {
+	r, ok := e.lex.ReadRune()
 	if !ok {
 		return nil, false, nil
 	}
 	if r != '(' {
-		e.lexer.unreadRune()
+		e.lex.UnreadRune(r)
 		return nil, false, nil
 	}
 
 	var args []string
-	var currentArg bytes.Buffer
-	depth := 0
+	var current strings.Builder
+	parenDepth := 0
+	quoteDepth := 0
+
+	lq := e.lex.LeftQuote
+	rq := e.lex.RightQuote
 
 	for {
-		tok, err := e.lexer.NextToken()
-		if err == io.EOF {
+		r, ok := e.lex.ReadRune()
+		if !ok {
 			return nil, true, fmt.Errorf("unexpected EOF while reading macro arguments")
 		}
-		if err != nil {
-			return nil, true, err
+
+		sr := string(r)
+		if sr == lq {
+			quoteDepth++
+			current.WriteString(lq)
+			continue
+		}
+		if quoteDepth > 0 && sr == rq {
+			quoteDepth--
+			current.WriteString(rq)
+			continue
 		}
 
-		switch tok.Type {
-		case TokenQuoted:
-			// クォート文字列は、内側のクォート構造を保ったまま復元してバッファへ
-			currentArg.WriteString(e.lexer.leftQuote)
-			currentArg.WriteString(tok.Value)
-			currentArg.WriteString(e.lexer.rightQuote)
+		if quoteDepth > 0 {
+			current.WriteRune(r)
+			continue
+		}
 
-		case TokenOther:
-			switch tok.Value {
-			case "(":
-				depth++
-				currentArg.WriteString("(")
-			case ")":
-				if depth == 0 {
-					argStr := strings.TrimSpace(currentArg.String())
-					// 最初の引数かつ中身が完全に空の場合は引数なし扱い（例: FOO()）
-					if len(args) == 0 && argStr == "" {
-						return args, true, nil
-					}
-					args = append(args, unquoteOnce(argStr, e.lexer.leftQuote, e.lexer.rightQuote))
+		switch r {
+		case '(':
+			parenDepth++
+			current.WriteRune('(')
+		case ')':
+			if parenDepth == 0 {
+				argStr := stripOuterQuote(current.String(), lq, rq)
+				if len(args) == 0 && current.Len() == 0 {
 					return args, true, nil
 				}
-				depth--
-				currentArg.WriteString(")")
-			case ",":
-				if depth == 0 {
-					argStr := strings.TrimSpace(currentArg.String())
-					args = append(args, unquoteOnce(argStr, e.lexer.leftQuote, e.lexer.rightQuote))
-					currentArg.Reset()
-				} else {
-					currentArg.WriteString(",")
-				}
-			default:
-				currentArg.WriteString(tok.Value)
+				args = append(args, argStr)
+				return args, true, nil
 			}
-
+			parenDepth--
+			current.WriteRune(')')
+		case ',':
+			if parenDepth == 0 {
+				argStr := stripOuterQuote(current.String(), lq, rq)
+				args = append(args, argStr)
+				current.Reset()
+			} else {
+				current.WriteRune(',')
+			}
 		default:
-			currentArg.WriteString(tok.Value)
+			current.WriteRune(r)
 		}
 	}
 }
 
-// unquoteOnce は前後の外側クォートを1組だけ剥がします
-func unquoteOnce(s, left, right string) string {
-	if strings.HasPrefix(s, left) && strings.HasSuffix(s, right) {
-		trimmed := strings.TrimPrefix(s, left)
-		trimmed = strings.TrimSuffix(trimmed, right)
-		return trimmed
+func stripOuterQuote(s, lq, rq string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, lq) && strings.HasSuffix(s, rq) {
+		return s[len(lq) : len(s)-len(rq)]
 	}
 	return s
 }
 
-func (e *Engine) evalMacro(name string, args []string, hasParen bool) (string, error) {
+func (e *Engine) evalMacro(name string, args []string) (string, error) {
 	if fn, ok := e.builtins[name]; ok {
 		return fn(e, args)
 	}
@@ -197,7 +250,6 @@ func (e *Engine) evalMacro(name string, args []string, hasParen bool) (string, e
 		return "", nil
 	}
 
-	// ユーザー定義マクロの $1, $2, $#, $@ 置換
 	return substituteArgs(body, name, args), nil
 }
 

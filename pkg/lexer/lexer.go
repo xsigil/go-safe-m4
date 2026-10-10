@@ -1,9 +1,9 @@
-package m4
+package lexer
 
 import (
-	"bytes"
-	"io"
+	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 type TokenType int
@@ -21,187 +21,111 @@ type Token struct {
 }
 
 type Lexer struct {
-	stack       []*inputSource
-	leftQuote   string
-	rightQuote  string
-	leftComment string
-	rightComment string
-}
-
-type inputSource struct {
-	buf []rune
-	pos int
-}
-
-func (s *inputSource) readRune() (rune, bool) {
-	if s.pos >= len(s.buf) {
-		return 0, false
-	}
-	r := s.buf[s.pos]
-	s.pos++
-	return r, true
-}
-
-func (s *inputSource) unreadRune() {
-	if s.pos > 0 {
-		s.pos--
-	}
-}
-
-func (s *inputSource) peekRune() (rune, bool) {
-	if s.pos >= len(s.buf) {
-		return 0, false
-	}
-	return s.buf[s.pos], true
+	stack      []string
+	LeftQuote  string
+	RightQuote string
 }
 
 func NewLexer() *Lexer {
 	return &Lexer{
-		stack:        make([]*inputSource, 0),
-		leftQuote:    "`",
-		rightQuote:   "'",
-		leftComment:  "#",
-		rightComment: "\n",
+		stack:      make([]string, 0),
+		LeftQuote:  "`",
+		RightQuote: "'",
 	}
 }
 
-// PushInput は評価対象のテキストを入力スタックに積みます（後入れ先出しで先頭から評価）
-func (l *Lexer) PushInput(input string) {
-	l.stack = append(l.stack, &inputSource{
-		buf: []rune(input),
-		pos: 0,
-	})
-}
-
-func (l *Lexer) currentSource() *inputSource {
-	if len(l.stack) == 0 {
-		return nil
+func (l *Lexer) PushInput(s string) {
+	if s == "" {
+		return
 	}
-	return l.stack[len(l.stack)-1]
+	l.stack = append(l.stack, s)
 }
 
-func (l *Lexer) popSource() {
-	if len(l.stack) > 0 {
-		l.stack = l.stack[:len(l.stack)-1]
-	}
-}
-
-func (l *Lexer) readRune() (rune, bool) {
+// ReadRune は utf8.DecodeRuneInString を用いて確実に先頭 1 rune を読み出します
+func (l *Lexer) ReadRune() (rune, bool) {
 	for len(l.stack) > 0 {
-		src := l.currentSource()
-		if r, ok := src.readRune(); ok {
-			return r, true
+		topIdx := len(l.stack) - 1
+		top := l.stack[topIdx]
+		if len(top) == 0 {
+			l.stack = l.stack[:topIdx]
+			continue
 		}
-		l.popSource()
+
+		r, size := utf8.DecodeRuneInString(top)
+		if r == utf8.RuneError && size == 1 {
+			// 不正バイトはスキップ
+			l.stack[topIdx] = top[1:]
+			continue
+		}
+		l.stack[topIdx] = top[size:]
+		return r, true
 	}
 	return 0, false
 }
 
-func (l *Lexer) unreadRune() {
-	if len(l.stack) > 0 {
-		l.currentSource().unreadRune()
-	}
+func (l *Lexer) UnreadRune(r rune) {
+	l.PushInput(string(r))
 }
 
-func (l *Lexer) matchPrefix(prefix string) bool {
-	if prefix == "" {
-		return false
+func (l *Lexer) NextToken() (Token, bool) {
+	r, ok := l.ReadRune()
+	if !ok {
+		return Token{Type: TokenEOF}, false
 	}
-	runes := []rune(prefix)
-	matched := 0
-	for _, expected := range runes {
-		r, ok := l.readRune()
-		if !ok {
-			break
-		}
-		if r != expected {
-			l.unreadRune()
-			break
-		}
-		matched++
+
+	// 1. クォート開始
+	if string(r) == l.LeftQuote {
+		val := l.readQuoted()
+		return Token{Type: TokenQuoted, Value: val}, true
 	}
-	if matched == len(runes) {
-		return true
-	}
-	// 不一致なら読んだ分を巻き戻す
-	for i := 0; i < matched; i++ {
-		l.unreadRune()
-	}
-	return false
-}
 
-// NextToken は次のトークンを取得します
-func (l *Lexer) NextToken() (Token, error) {
-	for {
-		r, ok := l.readRune()
-		if !ok {
-			return Token{Type: TokenEOF}, io.EOF
-		}
-
-		// クォート開始判定
-		l.unreadRune()
-		if l.matchPrefix(l.leftQuote) {
-			quoted, err := l.readQuoted()
-			return Token{Type: TokenQuoted, Value: quoted}, err
-		}
-
-		r, _ = l.readRune()
-
-		// 識別子（アルファベットまたはアンダースコアで始まる単語）
-		if isIdentStart(r) {
-			var buf bytes.Buffer
-			buf.WriteRune(r)
-			for {
-				nr, nok := l.readRune()
-				if !nok {
-					break
-				}
-				if isIdentPart(nr) {
-					buf.WriteRune(nr)
-				} else {
-					l.unreadRune()
-					break
-				}
+	// 2. 識別子
+	if unicode.IsLetter(r) || r == '_' {
+		var sb strings.Builder
+		sb.WriteRune(r)
+		for {
+			nr, nok := l.ReadRune()
+			if !nok {
+				break
 			}
-			return Token{Type: TokenIdent, Value: buf.String()}, nil
+			if unicode.IsLetter(nr) || unicode.IsDigit(nr) || nr == '_' {
+				sb.WriteRune(nr)
+			} else {
+				l.UnreadRune(nr)
+				break
+			}
 		}
-
-		return Token{Type: TokenOther, Value: string(r)}, nil
+		return Token{Type: TokenIdent, Value: sb.String()}, true
 	}
+
+	// 3. その他
+	return Token{Type: TokenOther, Value: string(r)}, true
 }
 
-func (l *Lexer) readQuoted() (string, error) {
-	var buf bytes.Buffer
+func (l *Lexer) readQuoted() string {
+	var sb strings.Builder
 	depth := 1
 
 	for {
-		if l.matchPrefix(l.leftQuote) {
+		r, ok := l.ReadRune()
+		if !ok {
+			return sb.String()
+		}
+
+		if string(r) == l.LeftQuote {
 			depth++
-			buf.WriteString(l.leftQuote)
+			sb.WriteString(l.LeftQuote)
 			continue
 		}
-		if l.matchPrefix(l.rightQuote) {
+		if string(r) == l.RightQuote {
 			depth--
 			if depth == 0 {
-				return buf.String(), nil
+				return sb.String()
 			}
-			buf.WriteString(l.rightQuote)
+			sb.WriteString(l.RightQuote)
 			continue
 		}
 
-		r, ok := l.readRune()
-		if !ok {
-			// クォートが閉じずに EOF に達した場合はそのまま返す
-			return buf.String(), nil
-		}
-		buf.WriteRune(r)
+		sb.WriteRune(r)
 	}
-}
-
-func isIdentStart(r rune) bool {
-	return unicode.IsLetter(r) || r == '_'
-}
-
-func isIdentPart(r rune) bool {
-	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_'
 }

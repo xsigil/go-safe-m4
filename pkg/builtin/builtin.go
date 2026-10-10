@@ -39,6 +39,9 @@ func RegisterDefaults(ctx EngineContext) {
 	ctx.RegisterBuiltin("html_escape", BuiltinHTMLEscape)
 	ctx.RegisterBuiltin("json_escape", BuiltinJSONEscape)
 	ctx.RegisterBuiltin("sh_quote", BuiltinShellQuote)
+
+	// POSIX Builtins
+	RegisterPOSIX(ctx)
 }
 
 func BuiltinDefine(ctx EngineContext, args []string) (string, error) {

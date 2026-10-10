@@ -180,6 +180,28 @@ func (e *Engine) collectArgs() ([]string, bool, error) {
 	lq := e.lex.LeftQuote
 	rq := e.lex.RightQuote
 
+	processArg := func(raw string) (string, error) {
+		s := strings.TrimSpace(raw)
+		// クォートで囲まれていた場合：1重だけ剥がして再評価せずそのまま返す
+		if strings.HasPrefix(s, lq) && strings.HasSuffix(s, rq) {
+			return s[len(lq) : len(s)-len(rq)], nil
+		}
+		// クォートされていない引数の場合：評価（マクロ展開）を実行
+		if s == "" {
+			return "", nil
+		}
+		subEngine := &Engine{
+			lex:         lexer.NewLexer(),
+			macros:      e.macros,
+			builtins:    e.builtins,
+			diversions:  make(map[int]*strings.Builder),
+			currentDiv:  0,
+			sandboxRoot: e.sandboxRoot,
+			maxDepth:    e.maxDepth,
+		}
+		return subEngine.Expand(s)
+	}
+
 	for {
 		r, ok := e.lex.ReadRune()
 		if !ok {
@@ -209,7 +231,10 @@ func (e *Engine) collectArgs() ([]string, bool, error) {
 			current.WriteRune('(')
 		case ')':
 			if parenDepth == 0 {
-				argStr := stripOuterQuote(current.String(), lq, rq)
+				argStr, err := processArg(current.String())
+				if err != nil {
+					return nil, true, err
+				}
 				if len(args) == 0 && current.Len() == 0 {
 					return args, true, nil
 				}
@@ -220,7 +245,10 @@ func (e *Engine) collectArgs() ([]string, bool, error) {
 			current.WriteRune(')')
 		case ',':
 			if parenDepth == 0 {
-				argStr := stripOuterQuote(current.String(), lq, rq)
+				argStr, err := processArg(current.String())
+				if err != nil {
+					return nil, true, err
+				}
 				args = append(args, argStr)
 				current.Reset()
 			} else {
@@ -230,14 +258,6 @@ func (e *Engine) collectArgs() ([]string, bool, error) {
 			current.WriteRune(r)
 		}
 	}
-}
-
-func stripOuterQuote(s, lq, rq string) string {
-	s = strings.TrimSpace(s)
-	if strings.HasPrefix(s, lq) && strings.HasSuffix(s, rq) {
-		return s[len(lq) : len(s)-len(rq)]
-	}
-	return s
 }
 
 func (e *Engine) evalMacro(name string, args []string) (string, error) {

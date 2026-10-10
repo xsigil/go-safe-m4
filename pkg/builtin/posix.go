@@ -10,7 +10,6 @@ import (
 	"unicode/utf8"
 )
 
-// RegisterPOSIXRegisters は POSIX 規格の追加ビルトインを登録します
 func RegisterPOSIX(ctx EngineContext) {
 	ctx.RegisterBuiltin("len", BuiltinLen)
 	ctx.RegisterBuiltin("index", BuiltinIndex)
@@ -19,9 +18,11 @@ func RegisterPOSIX(ctx EngineContext) {
 	ctx.RegisterBuiltin("eval", BuiltinEval)
 	ctx.RegisterBuiltin("incr", BuiltinIncr)
 	ctx.RegisterBuiltin("decr", BuiltinDecr)
+	ctx.RegisterBuiltin("shift", BuiltinShift)
+	ctx.RegisterBuiltin("defn", BuiltinDefn)
+	ctx.RegisterBuiltin("changecom", BuiltinChangecom)
 }
 
-// BuiltinLen: len(string)
 func BuiltinLen(ctx EngineContext, args []string) (string, error) {
 	if len(args) == 0 {
 		return "0", nil
@@ -29,7 +30,6 @@ func BuiltinLen(ctx EngineContext, args []string) (string, error) {
 	return strconv.Itoa(utf8.RuneCountInString(args[0])), nil
 }
 
-// BuiltinIndex: index(string, substring)
 func BuiltinIndex(ctx EngineContext, args []string) (string, error) {
 	if len(args) < 2 {
 		return "-1", nil
@@ -40,11 +40,9 @@ func BuiltinIndex(ctx EngineContext, args []string) (string, error) {
 	if byteIdx < 0 {
 		return "-1", nil
 	}
-	// rune 単位のインデックスに変換
 	return strconv.Itoa(utf8.RuneCountInString(s[:byteIdx])), nil
 }
 
-// BuiltinSubstr: substr(string, from, [length])
 func BuiltinSubstr(ctx EngineContext, args []string) (string, error) {
 	if len(args) == 0 {
 		return "", nil
@@ -78,7 +76,7 @@ func BuiltinSubstr(ctx EngineContext, args []string) (string, error) {
 	return string(runes[from:]), nil
 }
 
-// BuiltinTranslit: translit(string, from, [to])
+// BuiltinTranslit: a-z などのハイフン範囲指定に対応
 func BuiltinTranslit(ctx EngineContext, args []string) (string, error) {
 	if len(args) == 0 {
 		return "", nil
@@ -87,10 +85,10 @@ func BuiltinTranslit(ctx EngineContext, args []string) (string, error) {
 		return args[0], nil
 	}
 
-	fromRunes := []rune(args[1])
+	fromRunes := expandRanges(args[1])
 	toRunes := []rune("")
 	if len(args) >= 3 {
-		toRunes = []rune(args[2])
+		toRunes = expandRanges(args[2])
 	}
 
 	mapping := make(map[rune]rune)
@@ -118,7 +116,22 @@ func BuiltinTranslit(ctx EngineContext, args []string) (string, error) {
 	return sb.String(), nil
 }
 
-// BuiltinIncr: incr(num)
+func expandRanges(s string) []rune {
+	runes := []rune(s)
+	var res []rune
+	for i := 0; i < len(runes); i++ {
+		if i+2 < len(runes) && runes[i+1] == '-' && runes[i] <= runes[i+2] {
+			for r := runes[i]; r <= runes[i+2]; r++ {
+				res = append(res, r)
+			}
+			i += 2
+		} else {
+			res = append(res, runes[i])
+		}
+	}
+	return res
+}
+
 func BuiltinIncr(ctx EngineContext, args []string) (string, error) {
 	if len(args) == 0 || args[0] == "" {
 		return "", fmt.Errorf("incr: missing argument")
@@ -130,7 +143,6 @@ func BuiltinIncr(ctx EngineContext, args []string) (string, error) {
 	return strconv.Itoa(n + 1), nil
 }
 
-// BuiltinDecr: decr(num)
 func BuiltinDecr(ctx EngineContext, args []string) (string, error) {
 	if len(args) == 0 || args[0] == "" {
 		return "", fmt.Errorf("decr: missing argument")
@@ -142,11 +154,72 @@ func BuiltinDecr(ctx EngineContext, args []string) (string, error) {
 	return strconv.Itoa(n - 1), nil
 }
 
-// BuiltinEval: eval(expression)
-// 安全に Go の AST パーサーを用いて整数演算式のみを解釈実行します
+// BuiltinShift: shift($@) -> 第1引数を破棄し、残りの引数をクォートしてカンマ結合
+func BuiltinShift(ctx EngineContext, args []string) (string, error) {
+	if len(args) <= 1 {
+		return "", nil
+	}
+	lq := ctx.GetLexer().LeftQuote
+	rq := ctx.GetLexer().RightQuote
+
+	var quoted []string
+	for _, arg := range args[1:] {
+		quoted = append(quoted, lq+arg+rq)
+	}
+	return strings.Join(quoted, ","), nil
+}
+
+// BuiltinDefn: defn(name) -> 定義済みマクロの内容をクォート付きで返す
+func BuiltinDefn(ctx EngineContext, args []string) (string, error) {
+	if len(args) == 0 || args[0] == "" {
+		return "", nil
+	}
+	name := args[0]
+	lq := ctx.GetLexer().LeftQuote
+	rq := ctx.GetLexer().RightQuote
+
+	// エンジン側の生マクロマップから取得（EngineContext 経由）
+	if getter, ok := ctx.(MacroGetter); ok {
+		if val, exists := getter.GetMacro(name); exists {
+			return lq + val + rq, nil
+		}
+	}
+	return "", nil
+}
+
+type MacroGetter interface {
+	GetMacro(name string) (string, bool)
+}
+
+// BuiltinChangecom: changecom([left], [right])
+func BuiltinChangecom(ctx EngineContext, args []string) (string, error) {
+	lex := ctx.GetLexer()
+	if len(args) == 0 || args[0] == "" {
+		// 引数なしはコメント機能無効化
+		lex.LeftComment = ""
+		lex.RightComment = ""
+		return "", nil
+	}
+	lex.LeftComment = args[0]
+	if len(args) >= 2 && args[1] != "" {
+		lex.RightComment = args[1]
+	} else {
+		lex.RightComment = "\n"
+	}
+	return "", nil
+}
+
+// BuiltinEval: eval(expression, [radix])
 func BuiltinEval(ctx EngineContext, args []string) (string, error) {
 	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
 		return "0", nil
+	}
+
+	radix := 10
+	if len(args) >= 2 && args[1] != "" {
+		if r, err := strconv.Atoi(strings.TrimSpace(args[1])); err == nil && r >= 2 && r <= 36 {
+			radix = r
+		}
 	}
 
 	exprStr := strings.TrimSpace(args[0])
@@ -160,7 +233,10 @@ func BuiltinEval(ctx EngineContext, args []string) (string, error) {
 		return "", fmt.Errorf("eval: %w", err)
 	}
 
-	return strconv.Itoa(val), nil
+	if radix == 10 {
+		return strconv.Itoa(val), nil
+	}
+	return strconv.FormatInt(int64(val), radix), nil
 }
 
 func evalAST(node ast.Expr) (int, error) {

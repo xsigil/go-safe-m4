@@ -12,6 +12,7 @@ const (
 	TokenEOF TokenType = iota
 	TokenIdent
 	TokenQuoted
+	TokenComment
 	TokenOther
 )
 
@@ -21,16 +22,20 @@ type Token struct {
 }
 
 type Lexer struct {
-	stack      []string
-	LeftQuote  string
-	RightQuote string
+	stack        []string
+	LeftQuote    string
+	RightQuote   string
+	LeftComment  string
+	RightComment string
 }
 
 func NewLexer() *Lexer {
 	return &Lexer{
-		stack:      make([]string, 0),
-		LeftQuote:  "`",
-		RightQuote: "'",
+		stack:        make([]string, 0),
+		LeftQuote:    "`",
+		RightQuote:   "'",
+		LeftComment:  "#",
+		RightComment: "\n",
 	}
 }
 
@@ -41,7 +46,6 @@ func (l *Lexer) PushInput(s string) {
 	l.stack = append(l.stack, s)
 }
 
-// ReadRune は utf8.DecodeRuneInString を用いて確実に先頭 1 rune を読み出します
 func (l *Lexer) ReadRune() (rune, bool) {
 	for len(l.stack) > 0 {
 		topIdx := len(l.stack) - 1
@@ -53,7 +57,6 @@ func (l *Lexer) ReadRune() (rune, bool) {
 
 		r, size := utf8.DecodeRuneInString(top)
 		if r == utf8.RuneError && size == 1 {
-			// 不正バイトはスキップ
 			l.stack[topIdx] = top[1:]
 			continue
 		}
@@ -67,19 +70,57 @@ func (l *Lexer) UnreadRune(r rune) {
 	l.PushInput(string(r))
 }
 
+// MatchPrefix は入力スタック先頭が prefix と一致するかを検査し、一致すれば消費する
+func (l *Lexer) MatchPrefix(prefix string) bool {
+	if prefix == "" {
+		return false
+	}
+	var readRunes []rune
+	matched := true
+
+	for _, pr := range prefix {
+		r, ok := l.ReadRune()
+		if !ok {
+			matched = false
+			break
+		}
+		readRunes = append(readRunes, r)
+		if r != pr {
+			matched = false
+			break
+		}
+	}
+
+	if matched {
+		return true
+	}
+
+	// 不一致の場合は逆順でアンリードして元に戻す
+	for i := len(readRunes) - 1; i >= 0; i-- {
+		l.UnreadRune(readRunes[i])
+	}
+	return false
+}
+
 func (l *Lexer) NextToken() (Token, bool) {
+	// 1. コメント判定（マルチ文字対応）
+	if l.LeftComment != "" && l.MatchPrefix(l.LeftComment) {
+		val := l.readComment()
+		return Token{Type: TokenComment, Value: l.LeftComment + val}, true
+	}
+
+	// 2. クォート開始判定（マルチ文字対応）
+	if l.MatchPrefix(l.LeftQuote) {
+		val := l.readQuoted()
+		return Token{Type: TokenQuoted, Value: val}, true
+	}
+
 	r, ok := l.ReadRune()
 	if !ok {
 		return Token{Type: TokenEOF}, false
 	}
 
-	// 1. クォート開始
-	if string(r) == l.LeftQuote {
-		val := l.readQuoted()
-		return Token{Type: TokenQuoted, Value: val}, true
-	}
-
-	// 2. 識別子
+	// 3. 識別子判定
 	if unicode.IsLetter(r) || r == '_' {
 		var sb strings.Builder
 		sb.WriteRune(r)
@@ -98,7 +139,7 @@ func (l *Lexer) NextToken() (Token, bool) {
 		return Token{Type: TokenIdent, Value: sb.String()}, true
 	}
 
-	// 3. その他
+	// 4. その他
 	return Token{Type: TokenOther, Value: string(r)}, true
 }
 
@@ -107,17 +148,12 @@ func (l *Lexer) readQuoted() string {
 	depth := 1
 
 	for {
-		r, ok := l.ReadRune()
-		if !ok {
-			return sb.String()
-		}
-
-		if string(r) == l.LeftQuote {
+		if l.MatchPrefix(l.LeftQuote) {
 			depth++
 			sb.WriteString(l.LeftQuote)
 			continue
 		}
-		if string(r) == l.RightQuote {
+		if l.MatchPrefix(l.RightQuote) {
 			depth--
 			if depth == 0 {
 				return sb.String()
@@ -126,6 +162,30 @@ func (l *Lexer) readQuoted() string {
 			continue
 		}
 
+		r, ok := l.ReadRune()
+		if !ok {
+			return sb.String()
+		}
+		sb.WriteRune(r)
+	}
+}
+
+func (l *Lexer) readComment() string {
+	var sb strings.Builder
+	rc := l.RightComment
+	if rc == "" {
+		rc = "\n"
+	}
+
+	for {
+		if l.MatchPrefix(rc) {
+			sb.WriteString(rc)
+			return sb.String()
+		}
+		r, ok := l.ReadRune()
+		if !ok {
+			return sb.String()
+		}
 		sb.WriteRune(r)
 	}
 }

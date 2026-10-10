@@ -77,14 +77,9 @@ func TestEngine_POSIXBuiltins(t *testing.T) {
 			expected: "def",
 		},
 		{
-			name:     "translit mapping and deletion",
-			input:    "translit(`GNUs not Unix', `a-z', `A-Z')",
-			expected: "GNUs not Unix",
-		},
-		{
-			name:     "translit simple",
-			input:    "translit(`hello world', `el', `ip')",
-			expected: "hippo worpd",
+			name:     "translit range expansion",
+			input:    "translit(`hello 123', `a-z', `A-Z')",
+			expected: "HELLO 123",
 		},
 		{
 			name:     "translit deletion",
@@ -102,14 +97,34 @@ func TestEngine_POSIXBuiltins(t *testing.T) {
 			expected: "55",
 		},
 		{
-			name:     "eval comparison",
-			input:    "eval(`10 > 5')",
-			expected: "1",
+			name:     "eval radix hex",
+			input:    "eval(255, 16)",
+			expected: "ff",
 		},
 		{
-			name:     "eval combined with ifelse",
+			name:     "eval comparison with ifelse",
 			input:    "ifelse(eval(`10 > 5'), 1, `YES', `NO')",
 			expected: "YES",
+		},
+		{
+			name:     "defn preserves macro definition",
+			input:    "define(`A', `hello $1')define(`B', defn(`A'))B(`world')",
+			expected: "hello world",
+		},
+		{
+			name:     "shift discards first arg",
+			input:    "define(`TAIL', `shift($@)')TAIL(`one', `two', `three')",
+			expected: "two,three",
+		},
+		{
+			name:     "comments pass through without expanding macros",
+			input:    "define(`FOO', `bar')# FOO is not expanded\nFOO",
+			expected: "# FOO is not expanded\nbar",
+		},
+		{
+			name:     "changecom custom comment delimiters",
+			input:    "define(`FOO', `bar')changecom(`/*', `*/')/* FOO */ FOO",
+			expected: "/* FOO */ bar",
 		},
 	}
 

@@ -52,6 +52,11 @@ func (e *Engine) SetMacro(name, val string) {
 	e.macros[name] = val
 }
 
+func (e *Engine) GetMacro(name string) (string, bool) {
+	val, ok := e.macros[name]
+	return val, ok
+}
+
 func (e *Engine) DeleteMacro(name string) {
 	delete(e.macros, name)
 	delete(e.builtins, name)
@@ -96,7 +101,7 @@ func (e *Engine) Expand(input string) (string, error) {
 		}
 
 		switch tok.Type {
-		case lexer.TokenQuoted, lexer.TokenOther:
+		case lexer.TokenQuoted, lexer.TokenComment, lexer.TokenOther:
 			e.writeOutput(tok.Value)
 
 		case lexer.TokenIdent:
@@ -182,11 +187,9 @@ func (e *Engine) collectArgs() ([]string, bool, error) {
 
 	processArg := func(raw string) (string, error) {
 		s := strings.TrimSpace(raw)
-		// クォートで囲まれていた場合：1重だけ剥がして再評価せずそのまま返す
 		if strings.HasPrefix(s, lq) && strings.HasSuffix(s, rq) {
 			return s[len(lq) : len(s)-len(rq)], nil
 		}
-		// クォートされていない引数の場合：評価（マクロ展開）を実行
 		if s == "" {
 			return "", nil
 		}
@@ -203,21 +206,20 @@ func (e *Engine) collectArgs() ([]string, bool, error) {
 	}
 
 	for {
-		r, ok := e.lex.ReadRune()
-		if !ok {
-			return nil, true, fmt.Errorf("unexpected EOF while reading macro arguments")
-		}
-
-		sr := string(r)
-		if sr == lq {
+		if e.lex.MatchPrefix(lq) {
 			quoteDepth++
 			current.WriteString(lq)
 			continue
 		}
-		if quoteDepth > 0 && sr == rq {
+		if quoteDepth > 0 && e.lex.MatchPrefix(rq) {
 			quoteDepth--
 			current.WriteString(rq)
 			continue
+		}
+
+		r, ok := e.lex.ReadRune()
+		if !ok {
+			return nil, true, fmt.Errorf("unexpected EOF while reading macro arguments")
 		}
 
 		if quoteDepth > 0 {
